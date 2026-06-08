@@ -121,70 +121,96 @@ def carregar_todos_anos():
         return None, "sem_arquivos"
 
     dfs = []
+    arquivos_com_erro = []
     for nome in arquivos:
         caminho = os.path.join(pasta, nome)
         try:
             ext = nome.lower().split(".")[-1]
+
+            # Lê o arquivo — apenas CSV/TXT são suportados diretamente
+            # Para XLS, use o script converter_xls_para_csv.py antes do deploy
             if ext in ("xls", "xlsx"):
-                df = pd.read_excel(caminho, engine="xlrd" if ext == "xls" else "openpyxl")
-            else:
-                # Tenta vírgula, depois ponto-e-vírgula
+                st.warning(f"⚠️ {nome}: formato XLS não suportado no servidor. "
+                           f"Execute `converter_xls_para_csv.py` e suba os CSVs gerados.")
+                continue
+
+            # Tenta detectar separador automaticamente
+            for sep, dec in [(",", "."), (";", ","), ("\t", ".")]:
                 try:
-                    df = pd.read_csv(caminho, sep=",", decimal=".", encoding="latin-1")
+                    df_test = pd.read_csv(caminho, sep=sep, decimal=dec,
+                                          encoding="utf-8", nrows=3)
+                    if len(df_test.columns) >= 3:
+                        df = pd.read_csv(caminho, sep=sep, decimal=dec,
+                                         encoding="utf-8")
+                        break
                 except Exception:
-                    df = pd.read_csv(caminho, sep=";", decimal=",", encoding="latin-1")
+                    try:
+                        df_test = pd.read_csv(caminho, sep=sep, decimal=dec,
+                                              encoding="latin-1", nrows=3)
+                        if len(df_test.columns) >= 3:
+                            df = pd.read_csv(caminho, sep=sep, decimal=dec,
+                                             encoding="latin-1")
+                            break
+                    except Exception:
+                        continue
+            else:
+                st.warning(f"⚠️ {nome}: não foi possível detectar o formato.")
+                continue
 
-            # Normaliza nomes das colunas
-            df.columns = [c.strip().lower() for c in df.columns]
+            # Normaliza colunas
+            df.columns = [str(c).strip().lower() for c in df.columns]
 
-            # Mapeia variações de nome
+            # Mapeia variações de nome para padrão
             renomear = {}
             for col in df.columns:
-                if col in ("data", "date", "datetime", "hora", "timestamp"):
+                c = col.strip().lower()
+                if c in ("data","date","datetime","hora","timestamp"):
                     renomear[col] = "data"
-                elif "pm10" in col or "pm 10" in col:
-                    renomear[col] = "pm10"
-                elif "pm2" in col:
-                    renomear[col] = "pm25"
-                elif "so2" in col or "so₂" in col:
-                    renomear[col] = "so2"
-                elif "no2" in col or "no₂" in col:
-                    renomear[col] = "no2"
-                elif col.startswith("o3") or "ozonio" in col or "ozônio" in col:
-                    renomear[col] = "o3"
-                elif col == "co" or col.startswith("co "):
-                    renomear[col] = "co"
+                elif "pm10" in c and "24" not in c: renomear[col] = "pm10"
+                elif "pm2"  in c:                   renomear[col] = "pm25"
+                elif "so2"  in c and "24" not in c: renomear[col] = "so2"
+                elif "no2"  in c:                   renomear[col] = "no2"
+                elif c.startswith("o3") or "ozonio" in c or "ozônio" in c:
+                                                    renomear[col] = "o3"
+                elif c == "co" or (c.startswith("co") and "8h" not in c and "24" not in c):
+                                                    renomear[col] = "co"
             df = df.rename(columns=renomear)
 
             if "data" not in df.columns:
                 continue
 
+            # Converte e valida datas
             df["data"] = pd.to_datetime(df["data"], dayfirst=True, errors="coerce")
-            df = df.dropna(subset=["data"])
+            df = df[df["data"].notna()].copy()
 
-            # Ignora arquivos sem datas válidas ou com menos de 24 linhas úteis
+            # Valida mínimo de leituras
             if len(df) < 24:
-                st.warning(f"⚠️ {nome}: sem dados horários válidos — ignorado.")
+                arquivos_com_erro.append(f"{nome} (sem leituras válidas)")
                 continue
 
-            # Garante que as datas correspondem ao ano esperado no nome do arquivo
+            # Valida que o ano bate com o nome do arquivo
             try:
                 ano_nome = int(''.join(filter(str.isdigit, nome))[-4:])
-                anos_no_arquivo = df["data"].dt.year.unique()
-                if ano_nome not in anos_no_arquivo:
-                    st.warning(f"⚠️ {nome}: datas no arquivo ({list(anos_no_arquivo)}) não batem com o ano do nome ({ano_nome}) — ignorado.")
+                df = df[df["data"].dt.year == ano_nome]
+                if len(df) < 24:
+                    arquivos_com_erro.append(f"{nome} (ano {ano_nome} sem dados)")
                     continue
             except Exception:
-                pass  # Se não conseguir extrair ano do nome, continua mesmo assim
+                pass
 
-            for p in ["pm10","so2","no2","o3","co","pm25"]:
+            # Converte poluentes para numérico
+            for p in ["pm10","pm25","so2","no2","o3","co"]:
                 if p in df.columns:
                     df[p] = pd.to_numeric(df[p], errors="coerce")
 
             dfs.append(df)
+
         except Exception as e:
-            st.warning(f"Erro ao ler {nome}: {e}")
+            arquivos_com_erro.append(f"{nome} ({e})")
             continue
+
+    if arquivos_com_erro:
+        st.warning("⚠️ Arquivos ignorados: " + " · ".join(arquivos_com_erro))
 
     if not dfs:
         return None, "erro_leitura"
@@ -406,6 +432,66 @@ fig_multi.update_layout(
                 yanchor="bottom", y=1.02),
 )
 st.plotly_chart(fig_multi, use_container_width=True)
+
+# ── Glossário ────────────────────────────────────
+st.subheader("📖 O que significa cada índice?")
+with st.expander("Clique para ver a descrição de cada poluente e das categorias IQAr", expanded=False):
+    col_g1, col_g2 = st.columns(2)
+    with col_g1:
+        st.markdown("""
+**🏭 PM10 — Partículas Inaláveis**
+Partículas sólidas ou líquidas com diâmetro ≤ 10 µm. Originam-se de poeira de ruas,
+obras, queima de biomassa e emissões industriais. Penetram no nariz e garganta.
+Limite CONAMA: **50 µg/m³** (média 24h)
+
+---
+**🚗 NO₂ — Dióxido de Nitrogênio**
+Gás emitido principalmente por veículos e usinas. Causa irritação pulmonar e contribui
+para a formação de ozônio e chuva ácida.
+Limite CONAMA: **200 µg/m³** (média 1h)
+
+---
+**☀️ O₃ — Ozônio**
+Formado pela reação de NOx e compostos orgânicos sob luz solar. Poluente típico
+de dias quentes e ensolarados. Irrita olhos, nariz e pulmões.
+Limite CONAMA: **100 µg/m³** (média 8h)
+""")
+    with col_g2:
+        st.markdown("""
+**🔥 SO₂ — Dióxido de Enxofre**
+Emitido pela queima de combustíveis com enxofre (petróleo, carvão) e indústrias.
+Causa broncoespasmo e chuva ácida.
+Limite CONAMA: **50 µg/m³** (média 24h)
+
+---
+**🛣 CO — Monóxido de Carbono**
+Gás inodoro resultante da combustão incompleta de motores. Reduz a capacidade
+do sangue de transportar oxigênio.
+Limite CONAMA: **9 ppm** (média 8h)
+
+---
+**💨 PM2.5 — Partículas Finas** *(quando disponível)*
+Partículas ≤ 2,5 µm — as mais perigosas. Chegam aos alvéolos pulmonares e
+podem entrar na corrente sanguínea.
+Limite CONAMA: **25 µg/m³** (média 24h)
+""")
+
+    st.divider()
+    st.markdown("**🌡 Categorias do IQAr — Resolução CONAMA Nº 506/2024**")
+    dados_cat = [
+        ("🟢", "Boa",                        "0 – 40",    "#00e400", "Qualidade satisfatória. Risco à saúde nulo ou muito baixo."),
+        ("🟡", "Moderada",                   "41 – 80",   "#cccc00", "Grupos muito sensíveis podem sentir leve desconforto."),
+        ("🟠", "Ruim para Grupos Sensíveis", "81 – 120",  "#ff7e00", "Crianças, idosos e pessoas com doenças respiratórias devem reduzir atividades ao ar livre."),
+        ("🔴", "Ruim",                       "121 – 200", "#ff0000", "Toda a população pode sentir efeitos. Grupos sensíveis devem evitar exposição."),
+        ("🟣", "Muito Ruim / Péssima",       "> 200",     "#8f3f97", "Alerta de saúde. Toda a população deve evitar atividades ao ar livre."),
+    ]
+    for emoji, cat, faixa, cor, desc in dados_cat:
+        st.markdown(
+            f"<div style='border-left:4px solid {cor}; padding:6px 12px; margin:4px 0;'>"
+            f"<strong>{emoji} {cat}</strong> &nbsp;·&nbsp; IQAr {faixa}<br>"
+            f"<span style='color:#aaa; font-size:0.88rem'>{desc}</span></div>",
+            unsafe_allow_html=True
+        )
 
 # ── Tabela resumo anual ───────────────────────────
 st.subheader("📋 Resumo Anual")
