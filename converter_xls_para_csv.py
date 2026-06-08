@@ -12,8 +12,8 @@ import os
 import pandas as pd
 import glob
 
-PASTA_ENTRADA = "."   # pasta onde estão os XLS
-PASTA_SAIDA   = "dados_csv"  # pasta de saída dos CSV
+PASTA_ENTRADA = "dados"    # pasta onde estão os XLS
+PASTA_SAIDA   = "dados"       # sobrescreve na mesma pasta dados/
 
 os.makedirs(PASTA_SAIDA, exist_ok=True)
 
