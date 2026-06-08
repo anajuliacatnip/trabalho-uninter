@@ -104,10 +104,13 @@ def categoria_iqar(iq):
 @st.cache_data(ttl=86400, show_spinner="Carregando dados da FEPAM...")
 def carregar_todos_anos():
     """
-    Lê todos os arquivos XLS/CSV da pasta dados/.
-    Estrutura esperada dos arquivos FEPAM:
-      data | pm10 | so2 | no2 | o3 | co   (dados horários)
-    Retorna DataFrame diário agregado por média.
+    Lê todos os arquivos XLS/XLSX da pasta dados/.
+
+    Formatos suportados:
+      • Até ~2023: uma aba, cabeçalho na linha 1 (data|pm10|so2|no2|o3|co)
+      • 2024+:     múltiplas abas (uma por estação), cabeçalho nas linhas 1-2
+
+    Retorna DataFrame diário agregado com coluna 'estacao'.
     """
     pasta = os.path.join(os.path.dirname(__file__), "dados")
     if not os.path.exists(pasta):
@@ -120,70 +123,101 @@ def carregar_todos_anos():
     if not arquivos:
         return None, "sem_arquivos"
 
+    def _normalizar_colunas(df):
+        """Renomeia colunas para padrão interno."""
+        df.columns = [str(c).strip().lower() for c in df.columns]
+        renomear = {}
+        for col in df.columns:
+            c = col.strip().lower()
+            if c in ("data","date","datetime","hora","timestamp"):
+                renomear[col] = "data"
+            elif ("pm10" in c or "pm 10" in c) and "24" not in c:
+                renomear[col] = "pm10"
+            elif "pm2" in c or "pm 2" in c:
+                renomear[col] = "pm25"
+            elif "so2" in c and "24" not in c:
+                renomear[col] = "so2"
+            elif "no2" in c:
+                renomear[col] = "no2"
+            elif c.startswith("o3") or "ozonio" in c or "ozônio" in c:
+                renomear[col] = "o3"
+            elif c == "co" or (c.startswith("co") and "8h" not in c and "24" not in c):
+                renomear[col] = "co"
+        return df.rename(columns=renomear)
+
+    def _ler_aba(df_raw, estacao, ano_nome):
+        """Processa um DataFrame bruto de uma aba/arquivo."""
+        df = df_raw.copy()
+
+        # Formato novo (2024+): linha 0 = nomes, linha 1 = unidades → pular linha 1
+        if df.iloc[0].astype(str).str.lower().str.contains("data|date").any():
+            df.columns = df.iloc[0].tolist()
+            df = df.iloc[2:].reset_index(drop=True)  # pula linha de unidades
+
+        df = _normalizar_colunas(df)
+
+        if "data" not in df.columns:
+            return None
+
+        df["data"] = pd.to_datetime(df["data"], dayfirst=True, errors="coerce")
+        df = df[df["data"].notna()].copy()
+
+        if len(df) < 24:
+            return None
+
+        # Filtra apenas o ano do arquivo
+        df = df[df["data"].dt.year == ano_nome]
+        if len(df) < 24:
+            return None
+
+        for p in ["pm10","pm25","so2","no2","o3","co"]:
+            if p in df.columns:
+                df[p] = pd.to_numeric(df[p], errors="coerce")
+
+        df["estacao"] = estacao
+        return df
+
     dfs = []
     for nome in arquivos:
+        # Ignora arquivo 2017 (corrompido na fonte FEPAM)
+        if "2017" in nome:
+            continue
+
         caminho = os.path.join(pasta, nome)
+        ext = nome.lower().split(".")[-1]
+
         try:
-            ext = nome.lower().split(".")[-1]
+            ano_nome = int(''.join(filter(str.isdigit, nome))[-4:])
+        except Exception:
+            continue
 
-            # Ignora arquivo 2017 (corrompido na fonte FEPAM)
-            if "2017" in nome:
-                continue
-
-            # Lê XLS ou CSV
-            if ext in ("xls", "xlsx"):
-                engine = "xlrd" if ext == "xls" else "openpyxl"
-                df = pd.read_excel(caminho, engine=engine)
+        try:
+            if ext == "xls":
+                xls = pd.ExcelFile(caminho, engine="xlrd")
+                sheets = xls.sheet_names
+            elif ext == "xlsx":
+                xls = pd.ExcelFile(caminho, engine="openpyxl")
+                sheets = xls.sheet_names
             else:
+                # CSV: trata como aba única sem nome de estação
                 try:
-                    df = pd.read_csv(caminho, sep=",", decimal=".", encoding="latin-1")
+                    df_raw = pd.read_csv(caminho, sep=",", decimal=".", encoding="latin-1")
                 except Exception:
-                    df = pd.read_csv(caminho, sep=";", decimal=",", encoding="latin-1")
-
-            # Normaliza colunas
-            df.columns = [str(c).strip().lower() for c in df.columns]
-
-            # Mapeia variações de nome para padrão
-            renomear = {}
-            for col in df.columns:
-                c = col.strip().lower()
-                if c in ("data","date","datetime","hora","timestamp"):
-                    renomear[col] = "data"
-                elif "pm10" in c and "24" not in c: renomear[col] = "pm10"
-                elif "pm2"  in c:                   renomear[col] = "pm25"
-                elif "so2"  in c and "24" not in c: renomear[col] = "so2"
-                elif "no2"  in c:                   renomear[col] = "no2"
-                elif c.startswith("o3") or "ozonio" in c or "ozônio" in c:
-                                                    renomear[col] = "o3"
-                elif c == "co" or (c.startswith("co") and "8h" not in c and "24" not in c):
-                                                    renomear[col] = "co"
-            df = df.rename(columns=renomear)
-
-            if "data" not in df.columns:
+                    df_raw = pd.read_csv(caminho, sep=";", decimal=",", encoding="latin-1")
+                resultado = _ler_aba(df_raw, f"Estação {ano_nome}", ano_nome)
+                if resultado is not None:
+                    dfs.append(resultado)
                 continue
 
-            # Converte e valida datas
-            df["data"] = pd.to_datetime(df["data"], dayfirst=True, errors="coerce")
-            df = df[df["data"].notna()].copy()
-
-            if len(df) < 24:
-                continue
-
-            # Filtra somente o ano correspondente ao nome do arquivo
-            try:
-                ano_nome = int(''.join(filter(str.isdigit, nome))[-4:])
-                df = df[df["data"].dt.year == ano_nome]
-                if len(df) < 24:
+            for sheet in sheets:
+                try:
+                    df_raw = pd.read_excel(xls, sheet_name=sheet, header=None)
+                    estacao = str(sheet).strip()
+                    resultado = _ler_aba(df_raw, estacao, ano_nome)
+                    if resultado is not None:
+                        dfs.append(resultado)
+                except Exception:
                     continue
-            except Exception:
-                pass
-
-            # Converte poluentes para numérico
-            for p in ["pm10","pm25","so2","no2","o3","co"]:
-                if p in df.columns:
-                    df[p] = pd.to_numeric(df[p], errors="coerce")
-
-            dfs.append(df)
 
         except Exception as e:
             st.warning(f"Erro ao ler {nome}: {e}")
@@ -194,10 +228,10 @@ def carregar_todos_anos():
 
     df_all = pd.concat(dfs, ignore_index=True)
 
-    # Agrega por dia (média das leituras horárias)
-    cols_pols = [c for c in ["pm10","so2","no2","o3","co","pm25"] if c in df_all.columns]
+    # Agrega por dia + estação
+    cols_pols = [c for c in ["pm10","pm25","so2","no2","o3","co"] if c in df_all.columns]
     df_all["dia"] = df_all["data"].dt.date
-    df_dia = df_all.groupby("dia")[cols_pols].mean().reset_index()
+    df_dia = df_all.groupby(["dia","estacao"])[cols_pols].mean().reset_index()
     df_dia["dia"] = pd.to_datetime(df_dia["dia"])
     df_dia = df_dia.sort_values("dia").reset_index(drop=True)
     df_dia["ano"]  = df_dia["dia"].dt.year
@@ -223,6 +257,17 @@ with st.sidebar:
         intervalo = st.slider("Intervalo de anos", ano_min, ano_max,
                               (ano_min, ano_max), step=1)
         st.divider()
+
+    # Filtro de estações
+    todas_estacoes = sorted(df_dia["estacao"].unique().tolist())
+    estacoes_sel = st.multiselect(
+        "Estações de monitoramento",
+        options=todas_estacoes,
+        default=todas_estacoes,
+        help="Selecione uma ou mais estações da Rede Ar do Sul"
+    )
+    if not estacoes_sel:
+        estacoes_sel = todas_estacoes
 
     poluente_label = st.selectbox("Poluente — análise", list(POLUENTES.keys()))
     poluente_col   = POLUENTES[poluente_label]
@@ -269,15 +314,20 @@ seu-repositorio/
     st.stop()
 
 # ── Filtra por intervalo de anos ─────────────────
-df = df_dia[(df_dia["ano"] >= intervalo[0]) & (df_dia["ano"] <= intervalo[1])].copy()
+df = df_dia[
+    (df_dia["ano"] >= intervalo[0]) &
+    (df_dia["ano"] <= intervalo[1]) &
+    (df_dia["estacao"].isin(estacoes_sel))
+].copy()
 anos_sel = sorted(df["ano"].unique().tolist())
 
 # ── Cabeçalho ────────────────────────────────────
 st.markdown("## 🌿 Qualidade do Ar — Porto Alegre")
+n_estacoes = df["estacao"].nunique()
 st.caption(
     f"Monitoramento Público de Transparência Ambiental · "
     f"Fonte: FEPAM – Rede Ar do Sul · "
-    f"{intervalo[0]}–{intervalo[1]} · {len(df):,} dias de medição"
+    f"{intervalo[0]}–{intervalo[1]} · {n_estacoes} estação(ões) · {len(df):,} registros diários"
 )
 st.divider()
 
