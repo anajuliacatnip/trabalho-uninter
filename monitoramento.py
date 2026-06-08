@@ -1,16 +1,18 @@
 """
-Dashboard de Qualidade do Ar – Porto Alegre
+Dashboard de Qualidade do Ar – Porto Alegre (2002–2024)
 Fonte: FEPAM – Rede Ar do Sul (dados oficiais)
 Resolução CONAMA Nº 506/2024
 """
 
 import streamlit as st
 import plotly.graph_objects as go
+import plotly.express as px
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta, timezone
+import os
+from datetime import datetime, timezone, timedelta
 
-# ── Configuração da página ──────────────────────
+# ── Configuração ─────────────────────────────────
 st.set_page_config(
     page_title="Qualidade do Ar – Porto Alegre",
     page_icon="🌿",
@@ -18,23 +20,28 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ── Constantes ──────────────────────────────────
-POLUENTES = ["PM2.5 (µg/m³)", "PM10 (µg/m³)", "NO2 (µg/m³)", "SO2 (µg/m³)", "O3 (µg/m³)", "CO (ppm)"]
+BRT = timezone(timedelta(hours=-3))
+
+POLUENTES = {
+    "PM10 (µg/m³)":  "pm10",
+    "SO2 (µg/m³)":   "so2",
+    "NO2 (µg/m³)":   "no2",
+    "O3 (µg/m³)":    "o3",
+    "CO (ppm)":       "co",
+}
 
 LIMITES_CONAMA = {
-    "PM2.5 (µg/m³)": 25,
     "PM10 (µg/m³)":  50,
-    "NO2 (µg/m³)":   200,
     "SO2 (µg/m³)":   50,
+    "NO2 (µg/m³)":   200,
     "O3 (µg/m³)":    100,
     "CO (ppm)":       9,
 }
 
 CORES = {
-    "PM2.5 (µg/m³)": "#58a6ff",
     "PM10 (µg/m³)":  "#bc8cff",
-    "NO2 (µg/m³)":   "#ffa657",
     "SO2 (µg/m³)":   "#ff7b72",
+    "NO2 (µg/m³)":   "#ffa657",
     "O3 (µg/m³)":    "#56d364",
     "CO (ppm)":       "#e3b341",
 }
@@ -47,38 +54,28 @@ CAT_CORES = {
     "Muito Ruim / Péssima":       "#8f3f97",
 }
 
-BRT = timezone(timedelta(hours=-3))
+MESES_PT = {1:"Jan",2:"Fev",3:"Mar",4:"Abr",5:"Mai",6:"Jun",
+            7:"Jul",8:"Ago",9:"Set",10:"Out",11:"Nov",12:"Dez"}
 
-# ── Funções utilitárias ──────────────────────────
+# ── Utilitários ──────────────────────────────────
 
-def hex_to_rgba(hex_color, alpha=0.13):
+def hex_to_rgba(hex_color, alpha=0.15):
     h = hex_color.lstrip("#")
     r, g, b = int(h[0:2],16), int(h[2:4],16), int(h[4:6],16)
     return f"rgba({r},{g},{b},{alpha})"
 
 
-def calcular_iqar(pm25, pm10, no2, so2, o3):
-    def idx(v, cb, ci):
-        for i in range(len(cb)-1):
-            if cb[i] <= v <= cb[i+1]:
-                return round((ci[i+1]-ci[i])/(cb[i+1]-cb[i])*(v-cb[i])+ci[i])
-        return 500 if v > cb[-1] else 0
-    ci = [0, 40, 80, 120, 200, 500]
-    iq = max([
-        idx(pm25, [0,25,60,125,210,600],    ci),
-        idx(pm10, [0,50,100,250,420,1200],  ci),
-        idx(no2,  [0,200,240,320,1130,2260],ci),
-        idx(so2,  [0,50,100,150,800,1600],  ci),
-        idx(o3,   [0,100,130,160,200,800],  ci),
-    ])
-    if iq <= 40:  return iq, "Boa",                        "#00e400"
-    if iq <= 80:  return iq, "Moderada",                   "#ffff00"
-    if iq <= 120: return iq, "Ruim para Grupos Sensíveis", "#ff7e00"
-    if iq <= 200: return iq, "Ruim",                       "#ff0000"
-    return iq,            "Muito Ruim / Péssima",          "#8f3f97"
+def calcular_iqar_pm10(pm10):
+    """IQAr baseado em PM10 (principal poluente disponível FEPAM 2002-2024)."""
+    cb = [0, 50, 100, 250, 420, 1200]
+    ci = [0, 40,  80, 120, 200,  500]
+    for i in range(len(cb)-1):
+        if cb[i] <= pm10 <= cb[i+1]:
+            return round((ci[i+1]-ci[i])/(cb[i+1]-cb[i])*(pm10-cb[i])+ci[i])
+    return 500 if pm10 > cb[-1] else 0
 
 
-def cat_label(iq):
+def categoria_iqar(iq):
     if iq <= 40:  return "Boa"
     if iq <= 80:  return "Moderada"
     if iq <= 120: return "Ruim para Grupos Sensíveis"
@@ -88,318 +85,325 @@ def cat_label(iq):
 
 # ── Carregamento de dados ────────────────────────
 
-@st.cache_data(ttl=3600)
-def carregar_dados_fepam(arquivo_csv=None):
+@st.cache_data(ttl=86400, show_spinner="Carregando dados da FEPAM...")
+def carregar_todos_anos():
     """
-    Prioridade:
-      1. CSV real da FEPAM carregado pelo usuário (upload)
-      2. Dados históricos simulados com padrões reais da Rede Ar do Sul
+    Lê todos os arquivos XLS/CSV da pasta dados/.
+    Estrutura esperada dos arquivos FEPAM:
+      data | pm10 | so2 | no2 | o3 | co   (dados horários)
+    Retorna DataFrame diário agregado por média.
+    """
+    pasta = os.path.join(os.path.dirname(__file__), "dados")
+    if not os.path.exists(pasta):
+        return None, "pasta_ausente"
 
-    Estrutura esperada do CSV da FEPAM:
-      Data | PM2.5 | PM10 | NO2 | SO2 | O3 | CO
-    """
-    if arquivo_csv is not None:
+    arquivos = sorted([
+        f for f in os.listdir(pasta)
+        if f.lower().endswith((".csv", ".xls", ".xlsx", ".txt"))
+    ])
+    if not arquivos:
+        return None, "sem_arquivos"
+
+    dfs = []
+    for nome in arquivos:
+        caminho = os.path.join(pasta, nome)
         try:
-            df = pd.read_csv(arquivo_csv, sep=";", decimal=",", encoding="latin-1")
-            # Tenta mapear colunas comuns do formato FEPAM
-            mapa = {}
+            ext = nome.lower().split(".")[-1]
+            if ext in ("xls", "xlsx"):
+                df = pd.read_excel(caminho, engine="xlrd" if ext == "xls" else "openpyxl")
+            else:
+                # Tenta vírgula, depois ponto-e-vírgula
+                try:
+                    df = pd.read_csv(caminho, sep=",", decimal=".", encoding="latin-1")
+                except Exception:
+                    df = pd.read_csv(caminho, sep=";", decimal=",", encoding="latin-1")
+
+            # Normaliza nomes das colunas
+            df.columns = [c.strip().lower() for c in df.columns]
+
+            # Mapeia variações de nome
+            renomear = {}
             for col in df.columns:
-                c = col.strip().upper()
-                if "DATA" in c or "DATE" in c:         mapa[col] = "data"
-                elif "PM2" in c or "PM 2" in c:        mapa[col] = "PM2.5 (µg/m³)"
-                elif "PM10" in c or "PM 10" in c:      mapa[col] = "PM10 (µg/m³)"
-                elif "NO2" in c or "NO₂" in c:         mapa[col] = "NO2 (µg/m³)"
-                elif "SO2" in c or "SO₂" in c:         mapa[col] = "SO2 (µg/m³)"
-                elif "O3" in c or "OZO" in c:          mapa[col] = "O3 (µg/m³)"
-                elif "CO" in c:                        mapa[col] = "CO (ppm)"
-            df = df.rename(columns=mapa)
+                if col in ("data", "date", "datetime", "hora", "timestamp"):
+                    renomear[col] = "data"
+                elif "pm10" in col or "pm 10" in col:
+                    renomear[col] = "pm10"
+                elif "pm2" in col:
+                    renomear[col] = "pm25"
+                elif "so2" in col or "so₂" in col:
+                    renomear[col] = "so2"
+                elif "no2" in col or "no₂" in col:
+                    renomear[col] = "no2"
+                elif col.startswith("o3") or "ozonio" in col or "ozônio" in col:
+                    renomear[col] = "o3"
+                elif col == "co" or col.startswith("co "):
+                    renomear[col] = "co"
+            df = df.rename(columns=renomear)
+
+            if "data" not in df.columns:
+                continue
+
             df["data"] = pd.to_datetime(df["data"], dayfirst=True, errors="coerce")
-            df = df.dropna(subset=["data"]).sort_values("data").reset_index(drop=True)
-            for p in POLUENTES:
-                if p not in df.columns:
-                    df[p] = np.nan
-                else:
+            df = df.dropna(subset=["data"])
+
+            for p in ["pm10","so2","no2","o3","co","pm25"]:
+                if p in df.columns:
                     df[p] = pd.to_numeric(df[p], errors="coerce")
-            return df, True   # True = dados reais
+
+            dfs.append(df)
         except Exception as e:
-            st.warning(f"Não foi possível ler o CSV: {e}. Usando dados simulados.")
+            st.warning(f"Erro ao ler {nome}: {e}")
+            continue
 
-    # ── Dados simulados baseados nos padrões FEPAM/Rede Ar do Sul ──
-    np.random.seed(42)
-    n = 90
-    hoje = datetime.now(BRT).replace(tzinfo=None)
-    datas = [hoje - timedelta(days=i) for i in range(n, 0, -1)]
+    if not dfs:
+        return None, "erro_leitura"
 
-    pm25 = 15 + 8*np.sin(np.linspace(0, 2*np.pi, n)) + np.random.normal(0, 4, n)
-    pm10 = pm25 * 1.8 + np.random.normal(0, 5, n)
-    no2  = 30 + 15*np.sin(np.linspace(np.pi/4, 2.25*np.pi, n)) + np.random.normal(0, 8, n)
-    so2  = 8  + 4*np.random.random(n) + np.random.normal(0, 2, n)
-    o3   = 50 + 20*np.sin(np.linspace(np.pi, 3*np.pi, n)) + np.random.normal(0, 10, n)
-    co   = 0.5 + 0.3*np.random.random(n) + np.random.normal(0, 0.1, n)
+    df_all = pd.concat(dfs, ignore_index=True)
 
-    for i in [15, 32, 58, 71]:
-        pm25[i] += np.random.uniform(25, 60)
-        pm10[i] += np.random.uniform(40, 80)
+    # Agrega por dia (média das leituras horárias)
+    cols_pols = [c for c in ["pm10","so2","no2","o3","co","pm25"] if c in df_all.columns]
+    df_all["dia"] = df_all["data"].dt.date
+    df_dia = df_all.groupby("dia")[cols_pols].mean().reset_index()
+    df_dia["dia"] = pd.to_datetime(df_dia["dia"])
+    df_dia = df_dia.sort_values("dia").reset_index(drop=True)
+    df_dia["ano"]  = df_dia["dia"].dt.year
+    df_dia["mes"]  = df_dia["dia"].dt.month
+    df_dia["iqar"] = df_dia["pm10"].apply(lambda x: calcular_iqar_pm10(x) if pd.notna(x) else np.nan)
+    df_dia["categoria"] = df_dia["iqar"].apply(lambda x: categoria_iqar(int(x)) if pd.notna(x) else "")
 
-    df = pd.DataFrame({
-        "data":           datas,
-        "PM2.5 (µg/m³)": np.clip(pm25, 2, 200).round(1),
-        "PM10 (µg/m³)":  np.clip(pm10, 5, 300).round(1),
-        "NO2 (µg/m³)":   np.clip(no2,  1, 200).round(1),
-        "SO2 (µg/m³)":   np.clip(so2,  0, 100).round(1),
-        "O3 (µg/m³)":    np.clip(o3,   5, 180).round(1),
-        "CO (ppm)":       np.clip(co,   0.1, 5).round(2),
-    })
-    return df, False   # False = dados simulados
+    return df_dia, "ok"
 
 
-# ── Sidebar ─────────────────────────────────────
+# ── Carrega ──────────────────────────────────────
+df_dia, status = carregar_todos_anos()
+
+# ── Sidebar ──────────────────────────────────────
 with st.sidebar:
     st.title("🌿 Qualidade do Ar")
-    st.caption("Porto Alegre — Monitoramento Público")
+    st.caption("Porto Alegre · 2002–2024")
     st.divider()
 
-    st.markdown("#### 📂 Carregar dados reais da FEPAM")
-    st.caption(
-        "Baixe o CSV em: [fepam.rs.gov.br/dados-do-monitoramento]"
-        "(https://www.fepam.rs.gov.br/dados-do-monitoramento) "
-        "e faça o upload abaixo."
-    )
-    arquivo = st.file_uploader("Upload do CSV da FEPAM", type=["csv", "txt"],
-                               help="Arquivo exportado da Rede Ar do Sul")
-    st.divider()
+    if status == "ok" and df_dia is not None:
+        anos_disp = sorted(df_dia["ano"].unique().tolist())
+        ano_min, ano_max = int(anos_disp[0]), int(anos_disp[-1])
+        intervalo = st.slider("Intervalo de anos", ano_min, ano_max,
+                              (ano_min, ano_max), step=1)
+        st.divider()
 
-    dias = st.slider("Período (dias)", 7, 90, 30, step=7)
-    poluente = st.selectbox("Poluente — série histórica", POLUENTES)
+    poluente_label = st.selectbox("Poluente — análise", list(POLUENTES.keys()))
+    poluente_col   = POLUENTES[poluente_label]
 
     st.divider()
     st.caption("**Fontes oficiais**")
     st.markdown("[FEPAM – Dados do Monitoramento](https://www.fepam.rs.gov.br/dados-do-monitoramento)")
     st.markdown("[Boletim Diário FEPAM](https://ww3.fepam.rs.gov.br/qualidade/boletim_qualidade_ar.asp)")
     st.markdown("[Relatórios FEPAM](https://www.fepam.rs.gov.br/relatorios-de-qualidade-do-ar)")
-    st.markdown("[SEMA/RS](https://sema.rs.gov.br)")
     st.divider()
     st.caption("Base legal: Resolução CONAMA Nº 506/2024")
     st.caption(f"Atualizado: {datetime.now(BRT).strftime('%d/%m/%Y %H:%M')} (BRT)")
 
-    if st.button("🔄 Atualizar"):
+    if st.button("🔄 Recarregar dados"):
         st.cache_data.clear()
         st.rerun()
 
-# ── Carregar dados ───────────────────────────────
-df_full, dados_reais = carregar_dados_fepam(arquivo)
-df = df_full.tail(dias).copy()
+# ── Sem dados: instruções ─────────────────────────
+if status != "ok" or df_dia is None:
+    st.markdown("## 🌿 Qualidade do Ar — Porto Alegre (2002–2024)")
+    st.error("Nenhum dado encontrado na pasta `dados/`.", icon="❌")
+    st.info("""
+**Como adicionar os dados:**
 
-ul = df.iloc[-1]
-pm25_v = float(ul["PM2.5 (µg/m³)"])
-pm10_v = float(ul["PM10 (µg/m³)"])
-no2_v  = float(ul["NO2 (µg/m³)"])
-so2_v  = float(ul["SO2 (µg/m³)"])
-o3_v   = float(ul["O3 (µg/m³)"])
-co_v   = float(ul["CO (ppm)"])
+1. Baixe os arquivos XLS de cada ano em:
+   👉 [fepam.rs.gov.br/dados-do-monitoramento](https://www.fepam.rs.gov.br/dados-do-monitoramento)
 
-iqar_val, iqar_cat, iqar_cor = calcular_iqar(pm25_v, pm10_v, no2_v, so2_v, o3_v)
-fonte_label = (
-    "✅ Dados reais da FEPAM – Rede Ar do Sul"
-    if dados_reais else
-    "⚠️ Dados simulados com padrões FEPAM (faça upload do CSV para dados reais)"
-)
+2. Crie uma pasta chamada **`dados`** dentro do repositório
 
-# ── Cabeçalho ───────────────────────────────────
+3. Coloque todos os arquivos lá (o nome não importa):
+```
+seu-repositorio/
+├── app.py
+├── requirements.txt
+└── dados/
+    ├── Qualidade_do_Ar_-_Dados_gerais_2002.xls
+    ├── Qualidade_do_Ar_-_Dados_gerais_2003.xls
+    ├── ...
+    └── Qualidade_do_Ar_-_Dados_gerais_2024.xls
+```
+
+4. Faça push no GitHub → o dashboard carrega tudo automaticamente ✅
+    """)
+    st.stop()
+
+# ── Filtra por intervalo de anos ─────────────────
+df = df_dia[(df_dia["ano"] >= intervalo[0]) & (df_dia["ano"] <= intervalo[1])].copy()
+anos_sel = sorted(df["ano"].unique().tolist())
+
+# ── Cabeçalho ────────────────────────────────────
 st.markdown("## 🌿 Qualidade do Ar — Porto Alegre")
-st.caption(f"Monitoramento Público de Transparência Ambiental · {fonte_label}")
+st.caption(
+    f"Monitoramento Público de Transparência Ambiental · "
+    f"Fonte: FEPAM – Rede Ar do Sul · "
+    f"{intervalo[0]}–{intervalo[1]} · {len(df):,} dias de medição"
+)
 st.divider()
 
-# ── Banner de aviso se simulado ─────────────────
-if not dados_reais:
-    st.info(
-        "📥 **Para exibir dados reais:** baixe o CSV da FEPAM em "
-        "[fepam.rs.gov.br/dados-do-monitoramento](https://www.fepam.rs.gov.br/dados-do-monitoramento) "
-        "e faça o upload pelo menu lateral.",
-        icon="ℹ️"
-    )
+# ── KPIs ─────────────────────────────────────────
+col_k = st.columns(5)
+iqar_medio = df["iqar"].mean()
+iqar_max   = df["iqar"].max()
+pm10_medio = df["pm10"].mean() if "pm10" in df.columns else np.nan
+dias_acima  = int((df["pm10"] > LIMITES_CONAMA["PM10 (µg/m³)"]).sum()) if "pm10" in df.columns else 0
+cat_freq    = df["categoria"].value_counts().idxmax() if df["categoria"].notna().any() else "—"
 
-# ── KPIs ────────────────────────────────────────
-cols = st.columns(7)
-kpis = [
-    ("🌡 IQAr",  iqar_val,       "",       iqar_cor,                "Índice geral de qualidade do ar"),
-    ("💨 PM2.5", f"{pm25_v:.1f}", "µg/m³", CORES["PM2.5 (µg/m³)"], "Partículas finas — atingem o pulmão"),
-    ("🏭 PM10",  f"{pm10_v:.1f}", "µg/m³", CORES["PM10 (µg/m³)"],  "Partículas inaláveis — irritam vias aéreas"),
-    ("🚗 NO₂",   f"{no2_v:.1f}",  "µg/m³", CORES["NO2 (µg/m³)"],   "Dióxido de nitrogênio — veículos"),
-    ("🔥 SO₂",   f"{so2_v:.1f}",  "µg/m³", CORES["SO2 (µg/m³)"],   "Dióxido de enxofre — indústria"),
-    ("☀️ O₃",    f"{o3_v:.1f}",   "µg/m³", CORES["O3 (µg/m³)"],    "Ozônio — reação solar + poluentes"),
-    ("🛣 CO",    f"{co_v:.2f}",   "ppm",   CORES["CO (ppm)"],       "Monóxido de carbono — combustão"),
-]
-for col, (label, val, unit, cor, desc) in zip(cols, kpis):
-    col.metric(label=label, value=f"{val} {unit}".strip())
-    col.caption(desc)
+_, iqar_cor = iqar_medio, CAT_CORES.get(categoria_iqar(int(iqar_medio)) if pd.notna(iqar_medio) else "Boa", "#888")
 
-st.markdown(
-    f"<div style='text-align:center; font-size:1.1rem; font-weight:700; "
-    f"color:{iqar_cor}; margin: 6px 0 16px'>IQAr: {iqar_cat} — conforme CONAMA 506/2024</div>",
-    unsafe_allow_html=True,
-)
+col_k[0].metric("📅 Período", f"{intervalo[0]}–{intervalo[1]}", f"{len(anos_sel)} anos")
+col_k[1].metric("🌡 IQAr Médio", f"{iqar_medio:.0f}" if pd.notna(iqar_medio) else "—",
+                categoria_iqar(int(iqar_medio)) if pd.notna(iqar_medio) else "")
+col_k[2].metric("🏭 PM10 Médio", f"{pm10_medio:.1f} µg/m³" if pd.notna(pm10_medio) else "—",
+                f"Limite: {LIMITES_CONAMA['PM10 (µg/m³)']} µg/m³")
+col_k[3].metric("⚠️ Dias acima do limite PM10", f"{dias_acima}",
+                f"{100*dias_acima/len(df):.1f}% dos dias")
+col_k[4].metric("🏆 Categoria mais frequente", cat_freq)
 
-# ── Série histórica + Gauge ──────────────────────
-col1, col2 = st.columns([3, 1])
+st.divider()
 
-with col1:
-    st.subheader(f"📈 Série Histórica — {poluente}")
-    cor_p = CORES[poluente]
-    fig_serie = go.Figure()
-    fig_serie.add_trace(go.Scatter(
-        x=df["data"], y=df[poluente],
-        mode="lines", name=poluente,
-        line=dict(color=cor_p, width=2.5),
-        fill="tozeroy", fillcolor=hex_to_rgba(cor_p),
+# ── Tendência anual ───────────────────────────────
+st.subheader(f"📈 Tendência Anual — {poluente_label}")
+
+if poluente_col in df.columns:
+    df_anual = df.groupby("ano")[poluente_col].agg(["mean","max","min"]).reset_index()
+    cor_p = CORES[poluente_label]
+
+    fig_tend = go.Figure()
+    fig_tend.add_trace(go.Scatter(
+        x=df_anual["ano"], y=df_anual["max"],
+        mode="lines", name="Máxima anual",
+        line=dict(color=cor_p, width=1, dash="dot"), opacity=0.5,
     ))
-    if poluente in LIMITES_CONAMA:
-        fig_serie.add_hline(
-            y=LIMITES_CONAMA[poluente],
+    fig_tend.add_trace(go.Scatter(
+        x=df_anual["ano"], y=df_anual["mean"],
+        mode="lines+markers", name="Média anual",
+        line=dict(color=cor_p, width=3),
+        marker=dict(size=8),
+        fill="tonexty", fillcolor=hex_to_rgba(cor_p, 0.08),
+    ))
+    if poluente_label in LIMITES_CONAMA:
+        fig_tend.add_hline(
+            y=LIMITES_CONAMA[poluente_label],
             line_dash="dash", line_color="#f78166",
-            annotation_text=f"Limite CONAMA: {LIMITES_CONAMA[poluente]}",
+            annotation_text=f"Limite CONAMA: {LIMITES_CONAMA[poluente_label]}",
             annotation_font_color="#f78166",
         )
-    fig_serie.update_layout(
-        height=320, margin=dict(l=0,r=0,t=10,b=0),
-        xaxis_tickformat="%d/%m", showlegend=False,
-        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-    )
-    st.plotly_chart(fig_serie, use_container_width=True)
-
-with col2:
-    st.subheader("🎯 IQAr Atual")
-    fig_gauge = go.Figure(go.Indicator(
-        mode="gauge+number",
-        value=iqar_val,
-        gauge={
-            "axis": {"range": [0, 500]},
-            "bar": {"color": iqar_cor, "thickness": 0.25},
-            "steps": [
-                {"range": [0,40],   "color": "rgba(0,228,0,0.1)"},
-                {"range": [40,80],  "color": "rgba(255,255,0,0.1)"},
-                {"range": [80,120], "color": "rgba(255,126,0,0.1)"},
-                {"range": [120,200],"color": "rgba(255,0,0,0.1)"},
-                {"range": [200,500],"color": "rgba(143,63,151,0.1)"},
-            ],
-        },
-        number={"font": {"color": iqar_cor, "size": 44}},
-    ))
-    fig_gauge.update_layout(
-        height=280, margin=dict(l=10,r=10,t=10,b=10),
-        paper_bgcolor="rgba(0,0,0,0)",
-    )
-    st.plotly_chart(fig_gauge, use_container_width=True)
-    st.markdown(
-        f"<p style='text-align:center; color:{iqar_cor}; font-weight:700'>{iqar_cat}</p>",
-        unsafe_allow_html=True,
-    )
-
-# ── Barras comparativas + Heatmap ────────────────
-col3, col4 = st.columns(2)
-
-with col3:
-    st.subheader("📊 Média do Período vs. Limite CONAMA")
-    pols = ["PM2.5 (µg/m³)", "PM10 (µg/m³)", "NO2 (µg/m³)", "SO2 (µg/m³)", "O3 (µg/m³)"]
-    fig_bar = go.Figure()
-    fig_bar.add_trace(go.Bar(
-        name="Média medida",
-        x=[p.split(" ")[0] for p in pols],
-        y=[df[p].mean() for p in pols],
-        marker_color=[CORES[p] for p in pols],
-        opacity=0.85,
-    ))
-    fig_bar.add_trace(go.Scatter(
-        name="Limite CONAMA",
-        x=[p.split(" ")[0] for p in pols],
-        y=[LIMITES_CONAMA[p] for p in pols],
-        mode="markers",
-        marker=dict(symbol="line-ew", size=22, color="#f78166",
-                    line=dict(color="#f78166", width=3)),
-    ))
-    fig_bar.update_layout(
-        height=320, margin=dict(l=0,r=0,t=10,b=0),
+    fig_tend.update_layout(
+        height=340, margin=dict(l=0,r=0,t=10,b=0),
+        xaxis=dict(tickmode="linear", dtick=1),
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
         legend=dict(bgcolor="rgba(0,0,0,0)"),
     )
-    st.plotly_chart(fig_bar, use_container_width=True)
+    st.plotly_chart(fig_tend, use_container_width=True)
+else:
+    st.info(f"Coluna `{poluente_col}` não encontrada nos dados.")
 
-with col4:
-    st.subheader("🗓 Heatmap — PM2.5 (últimos 30 dias)")
-    df30 = df_full.tail(30).copy()
-    df30["semana"]     = df30["data"].dt.isocalendar().week.astype(str)
-    df30["dia_semana"] = df30["data"].dt.day_name()
-    ordem = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
-    nomes = ["Seg","Ter","Qua","Qui","Sex","Sáb","Dom"]
-    pivot = df30.pivot_table(index="semana", columns="dia_semana",
-                             values="PM2.5 (µg/m³)", aggfunc="mean").reindex(columns=ordem)
-    fig_heat = go.Figure(go.Heatmap(
-        z=pivot.values, x=nomes,
-        colorscale=[[0,"#00e400"],[0.3,"#ffff00"],[0.6,"#ff7e00"],[0.8,"#ff0000"],[1,"#8f3f97"]],
-        zmin=0, zmax=60,
-        colorbar=dict(title="µg/m³"),
-        hovertemplate="PM2.5: %{z:.1f} µg/m³<extra></extra>",
-    ))
-    fig_heat.update_layout(
-        height=320, margin=dict(l=0,r=0,t=10,b=0),
+# ── Heatmap anual × mês ───────────────────────────
+col_a, col_b = st.columns(2)
+
+with col_a:
+    st.subheader(f"🗓 Sazonalidade — {poluente_label} (médias mensais por ano)")
+    if poluente_col in df.columns:
+        pivot = df.groupby(["ano","mes"])[poluente_col].mean().unstack(level=1)
+        pivot.columns = [MESES_PT.get(c, c) for c in pivot.columns]
+        fig_heat = go.Figure(go.Heatmap(
+            z=pivot.values,
+            x=pivot.columns.tolist(),
+            y=pivot.index.tolist(),
+            colorscale=[[0,"#00e400"],[0.4,"#ffff00"],[0.7,"#ff7e00"],[0.85,"#ff0000"],[1,"#8f3f97"]],
+            colorbar=dict(title=poluente_label.split("(")[1].replace(")","").strip()),
+            hovertemplate="Ano: %{y}<br>Mês: %{x}<br>Valor: %{z:.1f}<extra></extra>",
+        ))
+        fig_heat.update_layout(
+            height=380, margin=dict(l=0,r=0,t=10,b=0),
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            yaxis=dict(dtick=1),
+        )
+        st.plotly_chart(fig_heat, use_container_width=True)
+
+with col_b:
+    st.subheader("📊 Distribuição de Categorias IQAr por Ano")
+    df_cat = df.groupby(["ano","categoria"]).size().reset_index(name="dias")
+    total_ano = df_cat.groupby("ano")["dias"].transform("sum")
+    df_cat["pct"] = 100 * df_cat["dias"] / total_ano
+
+    fig_cat = go.Figure()
+    for cat, cor in CAT_CORES.items():
+        sub = df_cat[df_cat["categoria"] == cat]
+        if not sub.empty:
+            fig_cat.add_trace(go.Bar(
+                name=cat, x=sub["ano"], y=sub["pct"],
+                marker_color=cor, opacity=0.85,
+                hovertemplate=f"{cat}: %{{y:.1f}}%<extra></extra>",
+            ))
+    fig_cat.update_layout(
+        barmode="stack", height=380,
+        margin=dict(l=0,r=0,t=10,b=0),
+        xaxis=dict(tickmode="linear", dtick=1),
+        yaxis=dict(title="% dos dias"),
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        legend=dict(bgcolor="rgba(0,0,0,0)", orientation="h",
+                    yanchor="bottom", y=1.02),
     )
-    st.plotly_chart(fig_heat, use_container_width=True)
+    st.plotly_chart(fig_cat, use_container_width=True)
 
-# ── Pizza + Tabela ───────────────────────────────
-col5, col6 = st.columns([1, 2])
+# ── Comparativo de poluentes por ano ─────────────
+st.subheader("📉 Média Anual de Todos os Poluentes")
+cols_disp = {k: v for k, v in POLUENTES.items() if v in df.columns}
+df_anual_todos = df.groupby("ano")[[v for v in cols_disp.values()]].mean().reset_index()
 
-with col5:
-    st.subheader("🥧 Distribuição IQAr")
-    def cat_dia(row):
-        iq,_,_ = calcular_iqar(row["PM2.5 (µg/m³)"],row["PM10 (µg/m³)"],
-                                row["NO2 (µg/m³)"],  row["SO2 (µg/m³)"], row["O3 (µg/m³)"])
-        return cat_label(iq)
-
-    df["categoria"] = df.apply(cat_dia, axis=1)
-    contagem = df["categoria"].value_counts()
-    fig_pizza = go.Figure(go.Pie(
-        labels=contagem.index.tolist(),
-        values=contagem.values.tolist(),
-        marker_colors=[CAT_CORES.get(c,"#888") for c in contagem.index],
-        hole=0.42,
+fig_multi = go.Figure()
+for label, col in cols_disp.items():
+    fig_multi.add_trace(go.Scatter(
+        x=df_anual_todos["ano"], y=df_anual_todos[col],
+        mode="lines+markers", name=label,
+        line=dict(color=CORES[label], width=2),
+        marker=dict(size=6),
     ))
-    fig_pizza.update_layout(
-        height=300, margin=dict(l=0,r=0,t=10,b=0),
-        paper_bgcolor="rgba(0,0,0,0)",
-        legend=dict(bgcolor="rgba(0,0,0,0)", font_size=11),
-    )
-    st.plotly_chart(fig_pizza, use_container_width=True)
+fig_multi.update_layout(
+    height=320, margin=dict(l=0,r=0,t=10,b=0),
+    xaxis=dict(tickmode="linear", dtick=1),
+    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+    legend=dict(bgcolor="rgba(0,0,0,0)", orientation="h",
+                yanchor="bottom", y=1.02),
+)
+st.plotly_chart(fig_multi, use_container_width=True)
 
-with col6:
-    st.subheader("📋 Últimas Medições")
-    df_tab = df.tail(10)[["data","PM2.5 (µg/m³)","PM10 (µg/m³)","NO2 (µg/m³)",
-                           "SO2 (µg/m³)","O3 (µg/m³)","CO (ppm)","categoria"]].copy()
-    df_tab["data"] = df_tab["data"].dt.strftime("%d/%m/%Y")
-    df_tab = df_tab.rename(columns={"data": "Data"})
-    st.dataframe(
-        df_tab,
-        use_container_width=True,
-        hide_index=True,
-        height=300,
-        column_config={
-            "categoria": st.column_config.TextColumn("Categoria IQAr"),
-            "PM2.5 (µg/m³)": st.column_config.NumberColumn(format="%.1f µg/m³"),
-            "PM10 (µg/m³)":  st.column_config.NumberColumn(format="%.1f µg/m³"),
-            "NO2 (µg/m³)":   st.column_config.NumberColumn(format="%.1f µg/m³"),
-            "SO2 (µg/m³)":   st.column_config.NumberColumn(format="%.1f µg/m³"),
-            "O3 (µg/m³)":    st.column_config.NumberColumn(format="%.1f µg/m³"),
-            "CO (ppm)":       st.column_config.NumberColumn(format="%.2f ppm"),
-        }
-    )
+# ── Tabela resumo anual ───────────────────────────
+st.subheader("📋 Resumo Anual")
+resumo = df.groupby("ano").agg(
+    Dias=("pm10","count"),
+    **{f"PM10 médio (µg/m³)": ("pm10","mean")},
+    **{f"PM10 máx (µg/m³)":   ("pm10","max")},
+    **{f"NO2 médio (µg/m³)":  ("no2","mean")} if "no2" in df.columns else {},
+    **{f"SO2 médio (µg/m³)":  ("so2","mean")} if "so2" in df.columns else {},
+    **{f"O3 médio (µg/m³)":   ("o3","mean")}  if "o3"  in df.columns else {},
+    **{f"CO médio (ppm)":     ("co","mean")}  if "co"  in df.columns else {},
+    IQAr_medio=("iqar","mean"),
+).reset_index()
+resumo = resumo.rename(columns={"ano":"Ano","IQAr_medio":"IQAr médio"})
+resumo["Categoria"] = resumo["IQAr médio"].apply(
+    lambda x: categoria_iqar(int(x)) if pd.notna(x) else "")
+
+for col in resumo.columns:
+    if resumo[col].dtype == float:
+        resumo[col] = resumo[col].round(1)
+
+st.dataframe(resumo, use_container_width=True, hide_index=True, height=400)
 
 # ── Rodapé ───────────────────────────────────────
 st.divider()
 st.caption(
-    "📚 **Fontes:** "
-    "[FEPAM – Dados do Monitoramento](https://www.fepam.rs.gov.br/dados-do-monitoramento) · "
-    "[Boletim Diário FEPAM](https://ww3.fepam.rs.gov.br/qualidade/boletim_qualidade_ar.asp) · "
-    "[Relatórios Anuais FEPAM](https://www.fepam.rs.gov.br/relatorios-de-qualidade-do-ar) · "
-    "[SEMA/RS](https://sema.rs.gov.br) · "
-    "Base legal: Resolução CONAMA Nº 506/2024"
+    "📚 **Fonte:** FEPAM – Rede Ar do Sul · "
+    "[fepam.rs.gov.br/dados-do-monitoramento](https://www.fepam.rs.gov.br/dados-do-monitoramento) · "
+    "[Boletim Diário](https://ww3.fepam.rs.gov.br/qualidade/boletim_qualidade_ar.asp) · "
+    "[Relatórios anuais](https://www.fepam.rs.gov.br/relatorios-de-qualidade-do-ar) · "
+    "Base legal: **Resolução CONAMA Nº 506/2024**"
 )
