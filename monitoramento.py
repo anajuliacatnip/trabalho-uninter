@@ -65,14 +65,30 @@ def hex_to_rgba(hex_color, alpha=0.15):
     return f"rgba({r},{g},{b},{alpha})"
 
 
-def calcular_iqar_pm10(pm10):
-    """IQAr baseado em PM10 (principal poluente disponível FEPAM 2002-2024)."""
-    cb = [0, 50, 100, 250, 420, 1200]
-    ci = [0, 40,  80, 120, 200,  500]
+def _iqar_escalar(v, cb, ci):
     for i in range(len(cb)-1):
-        if cb[i] <= pm10 <= cb[i+1]:
-            return round((ci[i+1]-ci[i])/(cb[i+1]-cb[i])*(pm10-cb[i])+ci[i])
-    return 500 if pm10 > cb[-1] else 0
+        if cb[i] <= v <= cb[i+1]:
+            return round((ci[i+1]-ci[i])/(cb[i+1]-cb[i])*(v-cb[i])+ci[i])
+    return 500 if v > cb[-1] else 0
+
+def calcular_iqar_row(row):
+    """
+    IQAr usando o melhor poluente disponível na linha.
+    Prioridade: PM10 > NO2 > O3 > SO2 > CO
+    """
+    ci = [0, 40, 80, 120, 200, 500]
+    indices = []
+    if pd.notna(row.get("pm10")): indices.append(_iqar_escalar(row["pm10"],[0,50,100,250,420,1200],ci))
+    if pd.notna(row.get("no2")):  indices.append(_iqar_escalar(row["no2"], [0,200,240,320,1130,2260],ci))
+    if pd.notna(row.get("o3")):   indices.append(_iqar_escalar(row["o3"],  [0,100,130,160,200,800],ci))
+    if pd.notna(row.get("so2")):  indices.append(_iqar_escalar(row["so2"], [0,50,100,150,800,1600],ci))
+    if pd.notna(row.get("co")):   indices.append(_iqar_escalar(row["co"],  [0,9,15,30,40,200],ci))
+    return max(indices) if indices else np.nan
+
+def calcular_iqar_pm10(pm10):
+    """Mantido para compatibilidade — usa só PM10."""
+    if pd.isna(pm10): return np.nan
+    return _iqar_escalar(pm10, [0,50,100,250,420,1200], [0,40,80,120,200,500])
 
 
 def categoria_iqar(iq):
@@ -146,6 +162,21 @@ def carregar_todos_anos():
             df["data"] = pd.to_datetime(df["data"], dayfirst=True, errors="coerce")
             df = df.dropna(subset=["data"])
 
+            # Ignora arquivos sem datas válidas ou com menos de 24 linhas úteis
+            if len(df) < 24:
+                st.warning(f"⚠️ {nome}: sem dados horários válidos — ignorado.")
+                continue
+
+            # Garante que as datas correspondem ao ano esperado no nome do arquivo
+            try:
+                ano_nome = int(''.join(filter(str.isdigit, nome))[-4:])
+                anos_no_arquivo = df["data"].dt.year.unique()
+                if ano_nome not in anos_no_arquivo:
+                    st.warning(f"⚠️ {nome}: datas no arquivo ({list(anos_no_arquivo)}) não batem com o ano do nome ({ano_nome}) — ignorado.")
+                    continue
+            except Exception:
+                pass  # Se não conseguir extrair ano do nome, continua mesmo assim
+
             for p in ["pm10","so2","no2","o3","co","pm25"]:
                 if p in df.columns:
                     df[p] = pd.to_numeric(df[p], errors="coerce")
@@ -168,7 +199,7 @@ def carregar_todos_anos():
     df_dia = df_dia.sort_values("dia").reset_index(drop=True)
     df_dia["ano"]  = df_dia["dia"].dt.year
     df_dia["mes"]  = df_dia["dia"].dt.month
-    df_dia["iqar"] = df_dia["pm10"].apply(lambda x: calcular_iqar_pm10(x) if pd.notna(x) else np.nan)
+    df_dia["iqar"] = df_dia.apply(calcular_iqar_row, axis=1)
     df_dia["categoria"] = df_dia["iqar"].apply(lambda x: categoria_iqar(int(x)) if pd.notna(x) else "")
 
     return df_dia, "ok"
