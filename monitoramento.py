@@ -121,41 +121,24 @@ def carregar_todos_anos():
         return None, "sem_arquivos"
 
     dfs = []
-    arquivos_com_erro = []
     for nome in arquivos:
         caminho = os.path.join(pasta, nome)
         try:
             ext = nome.lower().split(".")[-1]
 
-            # Lê o arquivo — apenas CSV/TXT são suportados diretamente
-            # Para XLS, use o script converter_xls_para_csv.py antes do deploy
-            if ext in ("xls", "xlsx"):
-                st.warning(f"⚠️ {nome}: formato XLS não suportado no servidor. "
-                           f"Execute `converter_xls_para_csv.py` e suba os CSVs gerados.")
+            # Ignora arquivo 2017 (corrompido na fonte FEPAM)
+            if "2017" in nome:
                 continue
 
-            # Tenta detectar separador automaticamente
-            for sep, dec in [(",", "."), (";", ","), ("\t", ".")]:
-                try:
-                    df_test = pd.read_csv(caminho, sep=sep, decimal=dec,
-                                          encoding="utf-8", nrows=3)
-                    if len(df_test.columns) >= 3:
-                        df = pd.read_csv(caminho, sep=sep, decimal=dec,
-                                         encoding="utf-8")
-                        break
-                except Exception:
-                    try:
-                        df_test = pd.read_csv(caminho, sep=sep, decimal=dec,
-                                              encoding="latin-1", nrows=3)
-                        if len(df_test.columns) >= 3:
-                            df = pd.read_csv(caminho, sep=sep, decimal=dec,
-                                             encoding="latin-1")
-                            break
-                    except Exception:
-                        continue
+            # Lê XLS ou CSV
+            if ext in ("xls", "xlsx"):
+                engine = "xlrd" if ext == "xls" else "openpyxl"
+                df = pd.read_excel(caminho, engine=engine)
             else:
-                st.warning(f"⚠️ {nome}: não foi possível detectar o formato.")
-                continue
+                try:
+                    df = pd.read_csv(caminho, sep=",", decimal=".", encoding="latin-1")
+                except Exception:
+                    df = pd.read_csv(caminho, sep=";", decimal=",", encoding="latin-1")
 
             # Normaliza colunas
             df.columns = [str(c).strip().lower() for c in df.columns]
@@ -183,17 +166,14 @@ def carregar_todos_anos():
             df["data"] = pd.to_datetime(df["data"], dayfirst=True, errors="coerce")
             df = df[df["data"].notna()].copy()
 
-            # Valida mínimo de leituras
             if len(df) < 24:
-                arquivos_com_erro.append(f"{nome} (sem leituras válidas)")
                 continue
 
-            # Valida que o ano bate com o nome do arquivo
+            # Filtra somente o ano correspondente ao nome do arquivo
             try:
                 ano_nome = int(''.join(filter(str.isdigit, nome))[-4:])
                 df = df[df["data"].dt.year == ano_nome]
                 if len(df) < 24:
-                    arquivos_com_erro.append(f"{nome} (ano {ano_nome} sem dados)")
                     continue
             except Exception:
                 pass
@@ -206,11 +186,8 @@ def carregar_todos_anos():
             dfs.append(df)
 
         except Exception as e:
-            arquivos_com_erro.append(f"{nome} ({e})")
+            st.warning(f"Erro ao ler {nome}: {e}")
             continue
-
-    if arquivos_com_erro:
-        st.warning("⚠️ Arquivos ignorados: " + " · ".join(arquivos_com_erro))
 
     if not dfs:
         return None, "erro_leitura"
