@@ -103,15 +103,7 @@ def categoria_iqar(iq):
 
 @st.cache_data(ttl=86400, show_spinner="Carregando dados da FEPAM...")
 def carregar_todos_anos():
-    """
-    Lê todos os arquivos XLS/XLSX da pasta dados/.
-
-    Formatos suportados:
-      • Até ~2023: uma aba, cabeçalho na linha 1 (data|pm10|so2|no2|o3|co)
-      • 2024+:     múltiplas abas (uma por estação), cabeçalho nas linhas 1-2
-
-    Retorna DataFrame diário agregado com coluna 'estacao'.
-    """
+   
     pasta = os.path.join(os.path.dirname(__file__), "dados")
     if not os.path.exists(pasta):
         return None, "pasta_ausente"
@@ -248,7 +240,7 @@ df_dia, status = carregar_todos_anos()
 # ── Sidebar ──────────────────────────────────────
 with st.sidebar:
     st.title("🌿 Qualidade do Ar")
-    st.caption("Porto Alegre · 2002–2024")
+    st.caption("Porto Alegre · 2002–2023")
     st.divider()
 
     if status == "ok" and df_dia is not None:
@@ -287,30 +279,10 @@ with st.sidebar:
 
 # ── Sem dados: instruções ─────────────────────────
 if status != "ok" or df_dia is None:
-    st.markdown("## 🌿 Qualidade do Ar — Porto Alegre (2002–2024)")
+    st.markdown("## 🌿 Qualidade do Ar — Porto Alegre (2002–2023)")
     st.error("Nenhum dado encontrado na pasta `dados/`.", icon="❌")
-    st.info("""
-**Como adicionar os dados:**
+    
 
-1. Baixe os arquivos XLS de cada ano em:
-   👉 [fepam.rs.gov.br/dados-do-monitoramento](https://www.fepam.rs.gov.br/dados-do-monitoramento)
-
-2. Crie uma pasta chamada **`dados`** dentro do repositório
-
-3. Coloque todos os arquivos lá (o nome não importa):
-```
-seu-repositorio/
-├── app.py
-├── requirements.txt
-└── dados/
-    ├── Qualidade_do_Ar_-_Dados_gerais_2002.xls
-    ├── Qualidade_do_Ar_-_Dados_gerais_2003.xls
-    ├── ...
-    └── Qualidade_do_Ar_-_Dados_gerais_2024.xls
-```
-
-4. Faça push no GitHub → o dashboard carrega tudo automaticamente ✅
-    """)
     st.stop()
 
 # ── Filtra por intervalo de anos ─────────────────
